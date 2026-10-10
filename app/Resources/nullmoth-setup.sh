@@ -134,7 +134,7 @@ if [ -n "$COLLECT" ]; then
   # the kernel's own words from the last boots: NVRM/NVAccel/NVRMFB print why they stopped (GSP boot, BAR, display).
   # A boot that hung early may not have reached the log store; a later boot's panic report then carries it.
   log show --last 3d --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "nvidia" OR eventMessage CONTAINS[c] "nullmoth" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
-    | tail -n 6000 > "$COLLECT/driver-kernel-log.txt"
+    | grep -v 'NVRM-fb: kapi event type 5$' | tail -n 6000 > "$COLLECT/driver-kernel-log.txt"
   log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-kernel-log.txt"
   # The current kernel message ring can retain early GSP/BAR failures absent from the log store.
   { echo; echo "== current kernel message ring"; dmesg 2>&1 | grep -iE 'nvrm|nvaccel|nvidia|nullmoth|gsp' | tail -n 2000; } >> "$COLLECT/driver-kernel-log.txt"
@@ -195,7 +195,21 @@ if [ -n "$COLLECT" ]; then
     mount_efi "$d" || continue; mp=$MOUNT_POINT
     collect_recent_logs "$d" 3 "$mp"/opencore-*.txt
     collect_recent_logs "$d" 5 "$mp"/panic-*.txt
+    # The EFI itself (10-09): most machines that fail run their own OpenCore config, and without it every fix was a
+    # guess from symptoms. The config goes up with the machine's identity removed (serial, board serial, UUID, ROM),
+    # plus the list of kexts, drivers and ACPI files beside it, so the working and the broken EFIs can be compared.
+    for cf in "$mp"/EFI/OC/config.plist "$mp"/EFI/OC/config.plist.nullmoth-*; do
+      [ -f "$cf" ] || continue
+      out="$COLLECT/$d-efi-$(basename "$cf").txt"
+      cp "$cf" "$out.plist" || { collection_errors=$((collection_errors+1)); continue; }
+      for k in SystemSerialNumber MLB SystemUUID ROM; do plutil -remove "PlatformInfo.Generic.$k" "$out.plist" >/dev/null 2>&1; done
+      plutil -convert xml1 -o "$out" "$out.plist" 2>/dev/null || mv "$out.plist" "$out"; rm -f "$out.plist"
+      n=$((n+1))
+    done
+    [ -d "$mp/EFI/OC" ] && { echo "== $d EFI/OC"; (cd "$mp/EFI/OC" && ls -1 Kexts Drivers ACPI Tools 2>/dev/null; ls -la OpenCore.efi 2>/dev/null); } >> "$COLLECT/$d-efi-files.txt"
   done
+  { echo; echo "== NullMoth NVRAM flags (a remove flag that survives every boot removes the driver at login)"
+    nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove 2>&1; } >> "$COLLECT/driver-state.txt"
   chmod -R a+rX "$COLLECT"; ok "collected driver state and $n diagnostic log(s)"; cleanup
   if [ "$collection_errors" -gt 0 ]; then note "$collection_errors diagnostic log(s) could not be copied"; echo "RESULT partial"; exit 1; fi
   echo "RESULT ok"; exit 0
@@ -347,6 +361,49 @@ else
     # Retain candidate discovery, but require explicit selection without boot-path proof.
     # File modification time does not identify the firmware startup partition: copies and clocks can match.
     # Require the actual boot-path/GPT identity or an explicit verified selection before changing OpenCore.
+    # Without boot-path (some configs hide it): the running Mac's serial number IS the config's SystemSerialNumber -
+    # OpenCore wrote it into this boot - so a candidate whose config holds this serial is the one that started the Mac.
+    # WAS: stopped and asked (15 Macs on 1.1-1.2, most with a 1401 stick plugged in next to the internal EFI).
+    if [ "$BOOT_BOUND" != 1 ]; then
+      serial=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformSerialNumber/{print $4}')
+      match=""
+      if [ -n "$serial" ]; then
+        for d in $found; do mount_efi "$d" || continue; mp=$MOUNT_POINT; rel=$(ocrel_in "$mp")
+          s=$(plutil -extract PlatformInfo.Generic.SystemSerialNumber raw -o - "$mp/$rel/config.plist" 2>/dev/null)
+          [ "$s" = "$serial" ] && match="$match $d"; done
+      fi
+      if [ "$(echo $match | wc -w | tr -d ' ')" = 1 ]; then
+        found=${match# }; BOOT_BOUND=1; ok "OpenCore started this Mac from $found (its config sets this Mac's serial number)"
+      elif [ -n "$match" ]; then
+        # The usual tie: OpenCore was copied from the 1401 stick to the macOS disk, so both configs set this serial.
+        # The copy on the disk macOS runs from is the one in use once a Mac starts without the stick (measured on a
+        # Mac with both: the internal copy is what started it).
+        esp=$(boot_esp)
+        for d in $match; do [ "$d" = "$esp" ] && { found=$d; BOOT_BOUND=1; ok "OpenCore started this Mac from $d (on the macOS disk; the copy on$(echo " $match" | sed "s/ $d//") sets the same serial)"; }; done
+      fi
+    fi
+    # Still two or more (user reports 10-10, Mac 1.5 and 1.6: disk0s1 + disk2s1, neither config's serial matched): OpenCore
+    # deletes and rewrites boot-args from its config at every start (NVRAM > Delete + Add), so the running boot-args are
+    # the started config's own, word for word. A candidate whose config sets exactly these boot-args and this Mac's model
+    # is the one that started it - when only one does.
+    if [ "$BOOT_BOUND" != 1 ]; then
+      live=$(nvram boot-args 2>/dev/null | cut -f2-); model=$(sysctl -n hw.model); match=""
+      if [ -n "$live" ]; then
+        for d in $found; do mount_efi "$d" || continue; mp=$MOUNT_POINT; rel=$(ocrel_in "$mp"); c="$mp/$rel/config.plist"
+          a=$(plutil -extract NVRAM.Add.7C436110-AB2A-4BBB-A880-FE41995C9F82.boot-args raw -o - "$c" 2>/dev/null)
+          m=$(plutil -extract PlatformInfo.Generic.SystemProductName raw -o - "$c" 2>/dev/null)
+          [ "$a" = "$live" ] && [ "$m" = "$model" ] && match="$match $d"; done
+      fi
+      if [ "$(echo $match | wc -w | tr -d ' ')" = 1 ]; then
+        found=${match# }; BOOT_BOUND=1; ok "OpenCore started this Mac from $found (its config sets exactly this boot's boot-args and model)"
+      fi
+    fi
+    # Only ONE OpenCore partition is connected, and OpenCore started this Mac (it writes opencore-version every boot):
+    # then that partition is the one (Mac 1.7 logs 10-10: "NOTE candidate disk0s2" alone, still stopped and asked).
+    if [ "$BOOT_BOUND" != 1 ] && [ "$(echo $found | wc -w | tr -d ' ')" = 1 ] && \
+       nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version >/dev/null 2>&1; then
+      found=${found# }; BOOT_BOUND=1; ok "OpenCore started this Mac and $found holds the only OpenCore on any connected disk"
+    fi
     if [ "$BOOT_BOUND" != 1 ]; then
       for d in $found; do echo "NOTE candidate $d"; done
       stop "OpenCore's startup partition could not be confirmed - select the partition this Mac started from"
@@ -531,8 +588,39 @@ fi
 NEEDBLOCK=0; bi=$(bidx)
 if [ -z "$bi" ]; then NEEDBLOCK=1; echo "CHANGE Kernel -> Block: exclude IONDRVSupport (the firmware framebuffer would take NVRMFB's display)"
 elif [ "$(get Kernel.Block.$bi.Enabled)" != true ]; then EDITS+=("Kernel.Block.$bi.Enabled|-bool|true"); echo "CHANGE Kernel -> Block: turn the IONDRVSupport exclude on"; fi
+# AMD (AMD Vanilla patches): with Shaneee's "Fix PAT" on, the driver stopped at "RmInitAdapter failed! (0x25:0x40:1310)"
+# right after a valid 8 GB BAR1 (user report 10-10, Ryzen 5 7600 + RTX 4060); switching to Algrey's "Fix PAT" - the one
+# 1401 builds with - reached the desktop and nothing else changed. Swap them where Algrey's entry for the same kernel range
+# is present but off; a config without it is left alone.
+i=0
+while cm=$(plutil -extract Kernel.Patch.$i.Comment raw -o - "$C" 2>/dev/null); do
+  case "$cm" in
+    *[Ss]haneee*[Ff]ix\ PAT*)
+      if [ "$(get Kernel.Patch.$i.Enabled)" = true ]; then
+        mn=$(get Kernel.Patch.$i.MinKernel); j=0
+        while cj=$(plutil -extract Kernel.Patch.$j.Comment raw -o - "$C" 2>/dev/null); do
+          case "$cj" in *[Aa]lgrey*[Ff]ix\ PAT*)
+            if [ "$(get Kernel.Patch.$j.MinKernel)" = "$mn" ] && [ "$(get Kernel.Patch.$j.Enabled)" != true ]; then
+              EDITS+=("Kernel.Patch.$i.Enabled|-bool|false" "Kernel.Patch.$j.Enabled|-bool|true")
+              echo "CHANGE Kernel -> Patch: Fix PAT from Shaneee's to Algrey's (Shaneee's stops the driver at RmInitAdapter on AMD)"
+            fi;;
+          esac
+          j=$((j+1))
+        done
+      fi;;
+  esac
+  i=$((i+1))
+done
 del=$(plutil -extract NVRAM.Delete.$B xml1 -o - "$C" 2>/dev/null); DELADD=()
 for k in boot-args csr-active-config; do echo "$del" | grep -q "<string>$k</string>" || { DELADD+=("$k"); echo "CHANGE NVRAM Delete: add $k (so OpenCore rewrites it every boot)"; }; done
+# A remove flag still set while installing is stale: installing means the driver is wanted. On some laptops and boards a
+# delete made from macOS never reaches the firmware (user report 10-09: the driver was removed 2 seconds after every
+# login, and "nvram -d" did not help), so the flag came back at every boot, kept the kexts off and ran the removal again.
+# OpenCore writes through the firmware before macOS starts, so it clears the flag there. The picker tool still works on
+# these machines when macOS is chosen in the same picker session, because the tool runs after OpenCore's delete.
+if nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 && ! echo "$del" | grep -q "<string>nullmoth-remove</string>"; then
+  DELADD+=("nullmoth-remove"); echo "CHANGE NVRAM Delete: add nullmoth-remove (a leftover remove flag this Mac cannot clear from macOS)"
+fi
 NEEDTOOL=0; [ -z "$(tool_index)" ] && { NEEDTOOL=1; echo "CHANGE boot picker: add \"$TOOL_NAME\" (the way back if the driver ever stops macOS starting)"; }
 [ ${#EDITS[@]} = 0 ] && [ ${#DELADD[@]} = 0 ] && [ $NEEDTOOL = 0 ] && [ $NEEDBLOCK = 0 ] && ok "OpenCore already has every setting the driver needs"
 
@@ -668,5 +756,77 @@ cat > "$RECOVER" <<PL
 PL
 chmod 644 "$RECOVER"; chown root:wheel "$RECOVER"
 ok "boot picker way back armed (NullMoth: Remove driver)"
+# Flicker stopgap (1.4): the first WindowServer of a boot composes against the driver's boot-console handoff and
+# strobes for many users; a WindowServer restart clears it ("sudo killall WindowServer after login" is the workaround
+# people share). This restarts it ONCE per boot, early, so the user logs into a clean compositor. The marker lives on a
+# tmpfs that is empty every boot, so it fires once and never loops. Opt out by creating /Library/NullMoth/no-wsreset.
+# This is a stopgap; the real fix is the boot->WindowServer surface/vblank handoff, chased with a >60 Hz/2nd display.
+cat > /Library/NullMoth/nullmoth-wsreset.sh <<'WS'
+#!/bin/bash
+# Flicker stopgap + evidence: the first WindowServer of a boot composes against the driver's boot handoff and strobes
+# for many; a restart clears it. We capture the display/driver state the flickering WindowServer leaves behind, restart
+# WindowServer once, then capture the clean state. The before/after lands in wsreset.log, which "Send logs" uploads, so
+# the strobe can be root-caused from a real >60 Hz / multi-monitor machine (it does not reproduce on the dev box).
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+[ -e /Library/NullMoth/no-wsreset ] && exit 0
+MARK=/var/run/nullmoth-wsreset.done
+[ -e "$MARK" ] && exit 0
+kextstat 2>/dev/null | grep -q com.nullmoth.NVAccel || exit 0
+nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 && exit 0
+LOG=/Library/NullMoth/wsreset.log
+capture() {
+  { echo "===== $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
+    echo "WindowServer: pid $(pgrep -x WindowServer | tr '\n' ' ')  uptime $(ps -o etime= -p "$(pgrep -x WindowServer | head -1)" 2>/dev/null | tr -d ' ')"
+    # current refresh per framebuffer, straight from the registry (pixelClock / pixelCount = Hz) - never ages out, so it
+    # always shows the >60 Hz / multi-monitor condition even if the boot log lines have scrolled off
+    echo "-- current mode per framebuffer (fb: WxH? pclk/total = Hz) --"
+    ioreg -r -c NVRMNVDAFramebuffer -w0 2>/dev/null | /usr/bin/awk '
+      /"IOFBDependentIndex" =/    { if (match($0, /= [0-9]+/)) idx = substr($0, RSTART+2, RLENGTH-2) }
+      /"IOFBCurrentPixelCount" =/ { if (match($0, /= [0-9]+/)) cnt = substr($0, RSTART+2, RLENGTH-2) }
+      /"IOFBCurrentPixelClock" =/ { if (match($0, /= [0-9]+/)) { clk = substr($0, RSTART+2, RLENGTH-2);
+        if (cnt+0 > 0) printf "   fb%s: %.2f Hz (pclk %s / total %s)\n", idx, clk/cnt, clk, cnt; cnt="" } }'
+    # displays, their mode, heads and connectors, from the fb boot log (wide window: the daemon runs seconds after boot)
+    echo "-- displays / heads (newest first) --"
+    log show --start "$SINCE" --style compact --predicate 'process == "kernel" AND eventMessage CONTAINS "NVRM-fb"' 2>/dev/null \
+      | grep -aE 'ENUMERATED|dpy [0-9]|head [0-9].*mode|connected [0-9].*edid|boot pair|hw vblank|TAKEOVER|SHUTDOWN|refresh rate from NVKMS' \
+      | uniq | tail -24 | sed 's/^[0-9-]* //'
+    # flip / vblank / modeset activity = what strobes; drop the once-a-minute keepalive noise
+    echo "-- flip / vblank / modeset (last 90s) --"
+    log show --start "$SINCE" --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS "NVRM-fb" OR eventMessage CONTAINS "nvkms")' 2>/dev/null \
+      | grep -aviE 'kapi event type 5|sample [0-9]' | grep -aiE 'flip|vbl|modeset|present|home|reflip|commit|latch|head' | uniq -c | tail -30 | sed 's/^[0-9-]* //'
+    # the driver's own in-registry trace + any counters it publishes
+    echo "-- NVRMFB registry --"
+    ioreg -r -c NVRMNVDAFramebuffer -w0 2>/dev/null | grep -oaE '"(NVRMTrace|NVRMTraceCount|reflips|fVblCalls|fBarPaints)" = [^,}]{0,200}' | tail -8
+    echo
+  } >> "$LOG" 2>&1
+}
+# keep the log to the last few boots
+[ -f "$LOG" ] && tail -c 262144 "$LOG" > "$LOG.keep" 2>/dev/null && mv "$LOG.keep" "$LOG"
+for i in $(seq 1 40); do pgrep -x WindowServer >/dev/null 2>&1 && break; sleep 1; done
+pgrep -x WindowServer >/dev/null 2>&1 || exit 0
+sleep 8   # let the first WindowServer settle into the (possibly flickering) steady state before we photograph it
+SINCE=$(date -r "$(sysctl -n kern.boottime | sed -E 's/.*\{ sec = ([0-9]+),.*/\1/')" '+%Y-%m-%d %H:%M:%S')
+capture "BEFORE restart"
+SINCE=$(date '+%Y-%m-%d %H:%M:%S')
+: > "$MARK"   # claim the single shot BEFORE touching WindowServer, so a respawn can never loop
+P=$(pgrep -x WindowServer); [ -n "$P" ] && { kill -TERM $P 2>/dev/null; sleep 2; pgrep -x WindowServer >/dev/null 2>&1 && kill -9 $P 2>/dev/null; }
+for i in $(seq 1 30); do pgrep -x WindowServer >/dev/null 2>&1 && break; sleep 1; done
+sleep 8
+capture "AFTER restart (should be clean)"
+echo "$(date) restarted WindowServer once; before/after captured above" >> "$LOG" 2>&1
+WS
+chmod 755 /Library/NullMoth/nullmoth-wsreset.sh; chown root:wheel /Library/NullMoth/nullmoth-wsreset.sh
+cat > /Library/LaunchDaemons/com.nullmoth.wsreset.plist <<'PL'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.nullmoth.wsreset</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/Library/NullMoth/nullmoth-wsreset.sh</string></array>
+<key>RunAtLoad</key><true/>
+<key>ProcessType</key><string>Background</string>
+</dict></plist>
+PL
+chmod 644 /Library/LaunchDaemons/com.nullmoth.wsreset.plist; chown root:wheel /Library/LaunchDaemons/com.nullmoth.wsreset.plist
+ok "flicker stopgap armed (restarts WindowServer once per boot; opt out with /Library/NullMoth/no-wsreset)"
 if [ $INSTALL_THEN_PREPARE = 1 ]; then do_prepare; else ok "driver installed - restart to load it"; fi
 cleanup; echo "RESULT ok"

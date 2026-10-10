@@ -6,7 +6,7 @@ The driver implements NVIDIA-backed display and Metal interfaces. Feature availa
 
 Made by **NullMoth Systems**.
 
-**Latest update:** [1401 and NVIDIA driver 1.1.0](docs/RELEASE-1.1.0.md). See the changes, validation and qualification scope before updating.
+**Latest update:** [1401 and NVIDIA driver 1.3.0](docs/RELEASE-1.3.0.md). See the changes, validation and qualification scope before updating.
 
 Installing macOS from Windows? Use **1401**: https://github.com/nullmoth/1401
 
@@ -68,8 +68,6 @@ maps your USB ports and, if the driver ever crashes the Mac, offers to make a cr
 **Something not working?** Open 1401 > Crash report > **Send logs to NullMoth**. It sends what 1401 did, the driver's
 state, driver crash reports, recent WindowServer crash reports and OpenCore's startup logs (names, serial numbers and addresses removed), each
 with a SHA-256 the site checks, and shows a report ID to quote in the NullMoth Discord.
-
-**macOS 26 Tahoe:** the package carries a separate NVAccel build, but full hardware and application qualification remains pending. The obsolete preparation action has been removed from the app; do not treat package contents as a verified upgrade path.
 
 **Keep the USB stick or disk OpenCore started your Mac from plugged in** while the app runs: that is the config it
 changes. A shared SMBIOS model alone does not establish the startup partition. Automatic USB-to-internal copying is disabled, preserving Windows and vendor boot files. Driver installation uses the selected startup partition. Keep the OpenCore stick attached for every restart until the internal boot setup is reviewed. After the install,

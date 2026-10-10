@@ -21,7 +21,7 @@ with (r/'calls.jsonl').open('a') as f:f.write(json.dumps([name]+a)+'\n')
 if name=='id':print('0')
 elif name=='uname':print('x86_64')
 elif name=='sw_vers':print('25G241' if a==['-buildVersion'] else os.environ.get('FAKE_OS_VERSION','15.8.1'))
-elif name=='ioreg':print('"vendor-id" = <de100000>')
+elif name=='ioreg':print('+-o GFX0@0  <class IOPCIDevice>\n    {\n      "device-id" = <'+os.environ.get('FAKE_NV_DEVICE','052d0000')+'>\n      "vendor-id" = <de100000>\n    }')
 elif name=='nvram':print('boot-args\tnvfb=1 nvaccel=1')
 elif name=='stat':
  p=Path(a[-1]);info=p.lstat()
@@ -30,6 +30,9 @@ elif name=='stat':
  else:sys.exit(98)
 
 elif name=='chown':pass
+elif name=='sudo':
+ # sudo -u _windowserver /bin/test -r FILE: WindowServer's user is "other" to a root:wheel file
+ sys.exit(0 if a[:2]==['-u','_windowserver'] and Path(a[-1]).stat().st_mode&0o004 else 1)
 elif name=='mktemp':
  counter=r/'temps';n=int(counter.read_text())+1 if counter.exists() else 1;counter.write_text(str(n))
  p=r/('scratch-'+str(n));p.mkdir();print(str(p))
@@ -89,7 +92,7 @@ class Install(unittest.TestCase):
             p=self.root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(value);self.old[p]=p.read_bytes()
         other=self.root/'Library/Extensions/NVMeFix.kext/fixture';other.parent.mkdir();other.write_text('unrelated');other.chmod(0o400);self.other=other
         self.bin=self.root/'bin';self.bin.mkdir()
-        for name in ['id','uname','sw_vers','ioreg','nvram','chown','mktemp','kmutil','stat']:
+        for name in ['id','uname','sw_vers','ioreg','nvram','chown','mktemp','kmutil','stat','sudo']:
             p=self.bin/name;p.write_text('#!'+sys.executable+'\n'+MOCK);p.chmod(0o755)
         source=(REPO/'package/install.sh').read_text()
         # Every installed path points into the private fixture. Real kmutil/ioreg/id are shadowed.
@@ -110,11 +113,20 @@ class Install(unittest.TestCase):
     def assert_creates(self,count):
         self.assertEqual(int((self.root/'creates').read_text()),count)
     def test_unqualified_os_is_refused_before_collection_or_backup(self):
-        r=self.run_install(FAKE_OS_VERSION='26.7.1')
+        r=self.run_install(FAKE_OS_VERSION='27.0')
         self.assertNotEqual(r.returncode,0)
-        self.assertIn('qualified for macOS 15 only',r.stdout+r.stderr)
+        self.assertIn('built for macOS 15 and 26',r.stdout+r.stderr)
         self.assertFalse((self.root/'creates').exists())
         self.assertFalse(list((self.root/'Library/NullMoth').glob('backup-*')))
+        for path,expected in self.old.items():self.assertEqual(path.read_bytes(),expected)
+
+    def test_pre_turing_card_is_refused_before_any_change(self):
+        # GTX 1060 (10DE:1C03): no GSP firmware, so the driver cannot run it; installing would switch off the
+        # firmware screen it is running on
+        r=self.run_install(FAKE_NV_DEVICE='031c0000')
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('older than the driver supports',r.stdout+r.stderr)
+        self.assertFalse((self.root/'creates').exists())
         for path,expected in self.old.items():self.assertEqual(path.read_bytes(),expected)
 
     def test_older_runtime_host_is_refused_before_collection_or_backup(self):
@@ -141,6 +153,11 @@ class Install(unittest.TestCase):
         create=[c for c in calls if c[:2]==['kmutil','create']][-1]
         self.assertEqual(create[create.index('--repository')+1],str(self.root/'Library/Extensions'))
         self.assertEqual(self.other.stat().st_mode&0o777,0o400)
+    def test_allow_list_is_readable_by_windowserver_even_from_a_private_copy(self):
+        # the privileged helper's umask 077 left the copy at 0600: WindowServer got no Metal device and aborted
+        (self.payload/'Library/GPUBundles/nvmtl-allow.txt').chmod(0o600)
+        r=self.run_install();self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertEqual((self.root/'Library/GPUBundles/nvmtl-allow.txt').stat().st_mode&0o777,0o644)
     def test_external_audited_installer_keeps_archived_payload_unchanged(self):
         audited=self.root/'audited-install.sh';audited.write_bytes(self.script.read_bytes())
         self.script.write_text('#!/bin/bash\necho ARCHIVED_INSTALLER_EXECUTED\nexit 99\n')
