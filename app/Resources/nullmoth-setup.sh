@@ -1,7 +1,9 @@
 #!/bin/bash
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 B=7C436110-AB2A-4BBB-A880-FE41995C9F82
-WANT_ARGS="nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80"
+# ipc_control_port_options=0: with AMFI relaxed, Firefox and other hardened apps crash at launch on their task control
+# port (10-10 chat: Firefox "instant crash", fixed by this argument); OpenCore Legacy Patcher sets it for the same reason.
+WANT_ARGS="nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0"
 DROP_ARGS="nv_disable=1 -wegnoegpu"          # both hide the NVIDIA card from macOS
 SIP_BITS=$((0x0A43))
 TOOL_NAME="1401: Remove NVIDIA driver"; TOOL_FILE=NullMothSafe.efi
@@ -15,7 +17,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --knob) KNOBS+=("$2"); shift;; --profile) PROFILE=$2; shift;;
   *) echo "STOP unknown option $1"; echo "RESULT stop"; exit 2;; esac; shift; done
 step() { echo "STEP $*"; }; ok() { echo "OK $*"; }; note() { echo "NOTE $*"; }
-cleanup() { for d in $MOUNTED; do diskutil unmount "$d" >/dev/null 2>&1; done; [ -n "$T" ] && rm -rf "$T"; }
+KT=""
+cleanup() { for d in $MOUNTED; do diskutil unmount "$d" >/dev/null 2>&1; done; [ -n "$T" ] && rm -rf "$T"; [ -n "${KT:-}" ] && rm -rf "$KT"; }
 stop() { echo "STOP $*"; cleanup; echo "RESULT stop"; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "STOP needs administrator rights"; echo "RESULT stop"; exit 1; }
 [ "$UPD" = finish ] && [ ! -f "$ST/update-pending" ] && { echo "RESULT ok"; exit 0; }
@@ -57,6 +60,22 @@ ocrel_in() {    # $1 = mount point; prints where OpenCore lives on it (EFI/OC, o
       cm=$(plutil -extract "$k" raw -o - "$c" 2>/dev/null); [ -n "$cm" ] && break; done
     [ -n "$m" ] && [ -n "$cm" ] && [ "$cm" != "$m" ] && continue
     echo $d; return; done; }
+# Kexts the driver's OpenCore setup needs, pinned to the same files 1401 builds with (p1401/mirror.json).
+kurl() { case $1 in
+  Lilu.kext) echo "https://github.com/dortania/build-repo/releases/download/Lilu-0515f40/Lilu-1.7.3-RELEASE.zip 261aebb9dc83adb6515c96405653f53c3c50b09c89babdb91fb41f7b33a1cd2a";;
+  AMFIPass.kext) echo "https://github.com/dortania/OpenCore-Legacy-Patcher/raw/main/payloads/Kexts/Acidanthera/AMFIPass-v1.4.1-RELEASE.zip 07b266145906db41f4b13a7938fbb173ea28888cc1fa65f84417f8820adc961e";;
+  USBToolBox.kext) echo "https://github.com/USBToolBox/kext/releases/download/1.2.0/USBToolBox-1.2.0-RELEASE.zip c315a3a5acfd496dd97d0d19b4fbd1d487103d2fd541c5651583d4c9cebcfe07";;
+esac; }
+# Downloads $1 into $KT/$1.x (checked against its SHA-256) before anything is changed; stops on any failure. $2 = where it goes.
+fetch_kext() {
+  local k=$1 u s
+  [ -n "$KT" ] || KT=$(mktemp -d) || stop "could not create a download folder"
+  read -r u s <<<"$(kurl $k)"
+  curl -fsSL --max-time 180 -o "$KT/$k.zip" "$u" \
+    || stop "$k could not be downloaded ($u). Check the internet connection and try again, or put $k in $2"
+  [ "$(shasum -a 256 "$KT/$k.zip" | awk '{print $1}')" = "$s" ] || stop "$k download did not match its SHA-256; nothing was changed. Try again"
+  ditto -x -k "$KT/$k.zip" "$KT/$k.x" && [ -f "$KT/$k.x/$k/Contents/Info.plist" ] || stop "$k download could not be unpacked; nothing was changed"
+}
 booted_part() { # the partition OpenCore started this Mac from, read from OpenCore's boot-path variable
   local bp u d
   bp=$(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path 2>/dev/null | cut -f2-)
@@ -106,6 +125,26 @@ if [ -n "$COLLECT" ]; then
   # copies files and prints state, and unmounts any EFI partition it mounted. Every OpenCore partition is checked,
   # sticks included, for OpenCore's own log (opencore-*.txt) and macOS panics it saved (panic-*.txt).
   mkdir -p "$COLLECT" || { echo "RESULT stop"; exit 1; }
+  # "Record flicker": 20 s of display timing taken while the user sees the flicker, before anything else runs. The
+  # accelerator's zero-copy flip counters and the framebuffer's commit/flip properties every 0.25 s, the driver's
+  # kernel messages, WindowServer's CPU and the refresh rate. Flicker never shows on a 60 Hz single-display test Mac,
+  # so the users' own machines are the measurement.
+  if [ "${NULLMOTH_SAMPLE:-}" = flicker ]; then
+    { echo "== display timing sample, $(date -u +%Y-%m-%dT%H:%M:%SZ), 20 s at 0.25 s"
+      system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Resolution|Refresh|UI Looks|Display Type|Connection Type|Online"
+      /usr/bin/log stream --style compact --predicate 'sender == "NVRMFB" OR sender == "NVRM" OR sender == "NVAccel"' > "$COLLECT/.flicker-kmsg" 2>&1 &
+      lp=$!
+      i=0; while [ $i -lt 80 ]; do
+        echo "-- t=$(( i * 250 ))ms"
+        sysctl debug 2>/dev/null | grep -E "nvaccel_(iop|flip|vbl|swap|present|async|crc)|nvrmfb" | tr '\n' ' '; echo
+        ioreg -r -c NVRMNVDAFramebuffer -d 1 2>/dev/null | grep -E '"NVRM(RejectedCommits|Flip|Vbl|Present)|"IOFBCurrentPixelClock' | tr -s ' ' | tr '\n' ' '; echo
+        ps -A -o %cpu=,comm= 2>/dev/null | grep -E "WindowServer$" | head -1
+        sleep 0.25; i=$((i + 1))
+      done
+      kill "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
+      echo; echo "== driver kernel messages during the sample"; tail -c 200000 "$COLLECT/.flicker-kmsg"; rm -f "$COLLECT/.flicker-kmsg"
+    } > "$COLLECT/display-flicker-sample.txt" 2>&1
+  fi
   for f in "$ST"/*.log "$ST/state"; do [ -f "$f" ] && cp "$f" "$COLLECT/driver-$(basename "$f").txt"; done
   { echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))   model $(sysctl -n hw.model)"
     echo "boot-args: $(nvram boot-args 2>/dev/null | cut -f2-)"; echo "SIP: $(csrutil status 2>/dev/null)"
@@ -134,7 +173,21 @@ if [ -n "$COLLECT" ]; then
   # the kernel's own words from the last boots: NVRM/NVAccel/NVRMFB print why they stopped (GSP boot, BAR, display).
   # A boot that hung early may not have reached the log store; a later boot's panic report then carries it.
   log show --last 3d --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "nvidia" OR eventMessage CONTAINS[c] "nullmoth" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
-    | grep -v 'NVRM-fb: kapi event type 5$' | tail -n 6000 > "$COLLECT/driver-kernel-log.txt"
+    | grep -v -e 'NVRM-fb: kapi event type 5$' -e 'NVRM-xnu: >os_map_kernel_space' -e 'NVRM-fb: flipToMemory #' \
+    | tail -n 6000 > "$COLLECT/driver-kernel-log.txt"
+  # 1.9.0 report (10-10, 2K 165 Hz monitor stuck at 1080p 60 Hz): the 6000-line tail above was all os_map_kernel_space
+  # and flipToMemory lines, so the boot-time mode list, the EDID and why each mode was or was not offered were gone.
+  # Everything the display decision used, from THIS boot only, never tailed away.
+  { echo "== monitors (EDID as macOS sees it)"
+    ioreg -l -w0 -r -c IODisplayConnect 2>/dev/null | grep -E '"(IODisplayEDID|DisplayProductName|DisplayVendorID|DisplayProductID)"'
+    echo; echo "== NVIDIA framebuffers"
+    ioreg -l -w0 -r -c NVRMNVDAFramebuffer 2>/dev/null | grep -E '"(IOFB[A-Za-z]*(Mode|Timing|Pixel|Display)[A-Za-z]*|nvrm[A-Za-z-]*|NVRM[A-Za-z]*|IOFBDependentIndex)"'
+    echo; echo "== framebuffer messages since this boot"
+    boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
+    log show --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
+      --predicate 'process == "kernel" AND (eventMessage CONTAINS "NVRM-fb" OR eventMessage CONTAINS "nvkms")' 2>&1 \
+      | grep -v -e 'kapi event type 5$' -e 'flipToMemory #' | head -n 4000
+  } > "$COLLECT/driver-display.txt" 2>&1
   log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-kernel-log.txt"
   # The current kernel message ring can retain early GSP/BAR failures absent from the log store.
   { echo; echo "== current kernel message ring"; dmesg 2>&1 | grep -iE 'nvrm|nvaccel|nvidia|nullmoth|gsp' | tail -n 2000; } >> "$COLLECT/driver-kernel-log.txt"
@@ -184,7 +237,21 @@ if [ -n "$COLLECT" ]; then
     done
   } > "$COLLECT/driver-crash-window.txt" 2>&1
   n=0; collection_errors=0
-  collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/*.panic
+  collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/*.panic /Library/Logs/DiagnosticReports/Retired/*.panic
+  # A boot that hung or went black never writes a panic: its kernel messages are only in the log store. Users could not
+  # send them (10-10 chat: "the logs from the kernel don't get saved to a file"), so keep the whole kernel log of the boots
+  # before this one, up to this boot's start: the tail is how the last failed boot ended.
+  { boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
+    echo "== kernel messages before this boot (started $(date -r "$boot" '+%Y-%m-%d %H:%M:%S'))"
+    log show --start "$(date -r $((boot - 259200)) '+%Y-%m-%d %H:%M:%S')" --end "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" \
+      --style compact --predicate 'process == "kernel"' 2>&1 \
+      | grep -v -e 'NVRM-fb: kapi event type 5$' -e 'NVRM-xnu: >os_map_kernel_space' -e 'NVRM-fb: flipToMemory #' \
+      | awk -v end="$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" '
+          # log show runs past --end (measured 10-10: this file ended in the current boot), so cut at the boot time here;
+          # a line without a timestamp belongs to the line above it
+          /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] / { keep = ($1 " " substr($2, 1, 8)) < end }
+          keep' | tail -n 8000
+  } > "$COLLECT/previous-boot-kernel-log.txt" 2>&1
   # WindowServer can fail outside a driver frame. Include the complete recent reports
   # during an explicit Send logs request; automatic crash notifications stay selective.
   collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/WindowServer*.ips /Library/Logs/DiagnosticReports/Retired/WindowServer*.ips
@@ -217,8 +284,23 @@ fi
 
 if [ $REMOVE = 1 ]; then
   step "Removing the NullMoth driver"
-  [ -f "$STATE" ] || stop "no install record in $STATE - was the driver installed by this app?"
-  . "$STATE" || stop "the install record is invalid - nothing changed"
+  if [ -f "$STATE" ]; then
+    . "$STATE" || stop "the install record is invalid - nothing changed"
+  else
+    # A driver installed from the 1401 stick, by hand, or by an app whose record was lost has no install record, and
+    # removal used to stop here (1.8 log 10-10), leaving the user with a driver they could not take out. Without a
+    # record nothing is restored from a backup: the driver's own settings come out of the OpenCore config this Mac
+    # started from (or the one selected), and the uninstaller removes its files.
+    note "no install record in $STATE; removing the driver from the OpenCore config this Mac started from"
+    CONFIG_SHA_AFTER=""; ADDED_ARGS=""; REMOVED_ARGS=""; CONFIG_BACKUP_REL=""
+    if [ -z "$CFG" ] && [ "$EFI" = auto ]; then
+      d=$(booted_part) || d=$(boot_esp)
+      [ -n "$d" ] || stop "no install record, and the OpenCore partition this Mac started from was not found; select its config.plist - nothing changed"
+      mount_efi "$d" || stop "could not mount the OpenCore partition $d - nothing changed"
+      r=$(ocrel_in "$MOUNT_POINT"); [ -n "$r" ] || stop "no OpenCore config for this Mac on $d; select its config.plist - nothing changed"
+      CONFIG_PATH="$MOUNT_POINT/$r/config.plist"; OCREL=$r
+    fi
+  fi
   C=""; MP=""
   if [ -n "$CFG" ]; then
     C=$CFG; [ -f "$C" ] || stop "the selected OpenCore config is missing - nothing changed"
@@ -298,7 +380,7 @@ if [ $REMOVE = 1 ]; then
     rm -f "$MP/${OCREL:-EFI/OC}/Tools/$TOOL_FILE" || stop "could not remove the picker tool; recovery remains available"
     ok "OpenCore removal settings published"
   fi
-  mv "$STATE" "$STATE.removed-$(date +%Y%m%d-%H%M%S)" || stop "could not archive the install record"
+  if [ -f "$STATE" ]; then mv "$STATE" "$STATE.removed-$(date +%Y%m%d-%H%M%S)" || stop "could not archive the install record"; fi
   rm -f "$AGENT" "$RECOVER" "$ST/nullmoth-recover.sh"
   ok "done - restart to finish"; cleanup; echo "RESULT ok"; exit 0
 fi
@@ -353,6 +435,10 @@ else
             cm=$(plutil -extract "$k" raw -o - "$c" 2>/dev/null); [ -n "$cm" ] && break; done
           echo "NOTE $d: OpenCore config ${c#$mp/} for ${cm:-no model set}"; done; done
       nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version >/dev/null 2>&1 || echo "NOTE OpenCore did not start this Mac (no opencore-version in NVRAM)"
+      # 10-10 (iMacPro1,1, MacBookPro16,1, iMac20,2): this stop printed no NOTE at all - no partition was even listed. Show
+      # what macOS sees, so the next report names the cause: where OpenCore says it started from, and every partition.
+      echo "NOTE boot-path: $(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path 2>/dev/null | cut -f2- | head -c 300)"
+      diskutil list 2>&1 | grep -E '^ +[0-9]+:|^/dev/' | head -n 40 | sed 's/^/NOTE disks: /'
       [ -n "$clover" ] && ! nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version >/dev/null 2>&1 && \
         stop "this Mac starts with Clover, not OpenCore - the NVIDIA driver's settings are made for OpenCore. Make an OpenCore setup (1401 on Windows builds one), start from it, then run this again"
       stop "no OpenCore config for this Mac ($(sysctl -n hw.model)) on any connected disk - plug in the disk or USB stick OpenCore started from, then try again (the NOTE lines above show what each partition holds)"
@@ -406,6 +492,11 @@ else
     fi
     if [ "$BOOT_BOUND" != 1 ]; then
       for d in $found; do echo "NOTE candidate $d"; done
+      # Mac 1.9/1.10 logs 10-10 (5 uploads, one candidate each): OpenCore hides boot-path and its version when
+      # Misc > Security > ExposeSensitiveData lacks bits 0x1/0x2, so nothing proves which partition started the Mac, and
+      # editing one that did not would install the driver without its settings or the removal tool. Say how to fix it.
+      nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version >/dev/null 2>&1 || \
+        echo "NOTE OpenCore hides where it started from: set Misc > Security > ExposeSensitiveData to 7 in this config.plist (bit 1 publishes boot-path; 1401 builds use 7), restart, then try again - or choose the partition in the app"
       stop "OpenCore's startup partition could not be confirmed - select the partition this Mac started from"
     fi
     EFI=${found# }
@@ -523,10 +614,14 @@ if [ -n "$USBMAP" ]; then
   case "$USBMAP" in */UTBMap.kext|*/UTBMap.kext/) K="${USBMAP%/}";; *) K="$USBMAP/UTBMap.kext";; esac
   [ -f "$K/Contents/Info.plist" ] || stop "the USB map the app wrote is missing ($K)"
   plutil -lint "$K/Contents/Info.plist" >/dev/null || stop "the USB map the app wrote is not valid"
-  KD="$(dirname "$C")/Kexts"; [ -d "$KD/USBToolBox.kext" ] || stop "USBToolBox.kext is not in $KD - the map needs it (1401 builds include it)"
+  KD="$(dirname "$C")/Kexts"
   kidx() { local i=0 p; while p=$(plutil -extract Kernel.Add.$i.BundlePath raw -o - "$C" 2>/dev/null); do [ "$p" = "$1" ] && { echo $i; return; }; i=$((i+1)); done; }
-  [ -n "$(kidx USBToolBox.kext)" ] || stop "USBToolBox.kext is not in the config's Kernel -> Add"
+  # The map is a USBToolBox map. 1.10 stopped when the EFI had no USBToolBox (10-10, an EFI not built by 1401); fetch it.
+  NEEDUTB=0; [ -d "$KD/USBToolBox.kext" ] || { fetch_kext USBToolBox.kext "$KD"; NEEDUTB=1; echo "CHANGE Kexts: add USBToolBox.kext (downloaded, SHA-256 checked)"; }
   BKC="$C.nullmoth-usb-$(date +%Y%m%d-%H%M%S)"; cp -p "$C" "$BKC" || stop "could not back up $C"; ok "backed up the config to $BKC"
+  [ $NEEDUTB = 0 ] || ditto "$KT/USBToolBox.kext.x/USBToolBox.kext" "$KD/USBToolBox.kext" || stop "could not copy USBToolBox.kext"
+  [ -n "$(kidx USBToolBox.kext)" ] || { plutil -insert Kernel.Add -json '{"Arch":"Any","BundlePath":"USBToolBox.kext","Comment":"USBToolBox (NullMoth USB map)","Enabled":true,"ExecutablePath":"Contents/MacOS/USBToolBox","MaxKernel":"","MinKernel":"","PlistPath":"Contents/Info.plist"}' -append "$C" \
+    || { cp -p "$BKC" "$C"; stop "could not add USBToolBox.kext to the config"; }; echo "CHANGE Kernel -> Add: USBToolBox.kext"; }
   [ -d "$KD/UTBMap.kext" ] && { mv "$KD/UTBMap.kext" "$KD/UTBMap.kext.nullmoth-$(date +%Y%m%d-%H%M%S)" || stop "could not move the old map aside"; note "the old UTBMap.kext was kept beside it"; }
   cp -R "$K" "$KD/UTBMap.kext" || { cp -p "$BKC" "$C"; stop "could not copy the map"; }
   fail=0
@@ -570,6 +665,27 @@ if [ "$sbm" != Disabled ]; then
   echo "CHANGE SecureBootModel: ${sbm:-unset} -> Disabled (Apple Secure Boot refuses kexts Apple did not sign)"
   EDITS+=("Misc.Security.SecureBootModel|-string|Disabled"); OLDSBM=${sbm:-Default}
 fi
+# AMFIPass (a Lilu plugin) is what lets WindowServer, a platform binary, load the ad hoc signed driver: with it off and
+# the same SIP bits and amfi boot-args, 1.9.0 logs (10-10, Ryzen 9 9900X) show "mapping process is a platform binary,
+# but mapped file is not", no Metal device and a black screen with a cursor. Every working machine has it on.
+kpos() { local i=0 p; while p=$(get Kernel.Add.$i.BundlePath); do [ "$p" = "$1" ] && { echo $i; return; }; i=$((i+1)); done; }
+KX="$(dirname "$C")/Kexts"; ADDK=(); FETCH=()
+# 1.10 stopped here when either kext was missing, and 1401 had only built AMFIPass for OCLP Wi-Fi, so updating users were
+# sent to rebuild an EFI that still lacked it (10-10: 9 uploads, several chat reports). Setup now fetches them itself,
+# from the same pinned files 1401 builds with (p1401/mirror.json), and checks each SHA-256 before anything is changed.
+for k in Lilu.kext AMFIPass.kext; do
+  ki=$(kpos $k)
+  [ -d "$KX/$k" ] || { FETCH+=($k); echo "CHANGE Kexts: add $k to $KX (downloaded, SHA-256 checked)"; }
+  if [ -n "$ki" ]; then
+    [ "$(get Kernel.Add.$ki.Enabled)" = true ] || { echo "CHANGE Kernel -> Add: turn $k on (the driver cannot load without it)"; EDITS+=("Kernel.Add.$ki.Enabled|-bool|true"); }
+  else
+    ADDK+=($k); echo "CHANGE Kernel -> Add: add $k (the driver cannot load without it)"
+  fi
+done
+for k in "${FETCH[@]+"${FETCH[@]}"}"; do fetch_kext $k "$KX"; done
+lp=$(kpos Lilu.kext); ap=$(kpos AMFIPass.kext)
+[ -n "$ap" ] && [ -n "$lp" ] && [ "$ap" -lt "$lp" ] && stop "AMFIPass.kext loads before Lilu.kext in Kernel -> Add; move it below Lilu in the config, then try again"
+NEEDAMFIPASS=$(( ${#ADDK[@]} + ${#FETCH[@]} ))
 # The macOS installer boots with a small GPU BAR (ResizeAppleGpuBars 0, so its fallback screen survives PCI setup); the
 # driver was tested with the card's full 8 GB BAR, so the installed system gets that back.
 bar=$(get UEFI.Quirks.ResizeGpuBars); abar=$(get Booter.Quirks.ResizeAppleGpuBars)
@@ -622,7 +738,7 @@ if nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 &&
   DELADD+=("nullmoth-remove"); echo "CHANGE NVRAM Delete: add nullmoth-remove (a leftover remove flag this Mac cannot clear from macOS)"
 fi
 NEEDTOOL=0; [ -z "$(tool_index)" ] && { NEEDTOOL=1; echo "CHANGE boot picker: add \"$TOOL_NAME\" (the way back if the driver ever stops macOS starting)"; }
-[ ${#EDITS[@]} = 0 ] && [ ${#DELADD[@]} = 0 ] && [ $NEEDTOOL = 0 ] && [ $NEEDBLOCK = 0 ] && ok "OpenCore already has every setting the driver needs"
+[ ${#EDITS[@]} = 0 ] && [ ${#DELADD[@]} = 0 ] && [ $NEEDTOOL = 0 ] && [ $NEEDBLOCK = 0 ] && [ $NEEDAMFIPASS = 0 ] && ok "OpenCore already has every setting the driver needs"
 
 if [ $SIPON = 1 ]; then
   note "SIP is still fully on in this boot: only SIP, Secure Boot, boot arguments and the boot picker entry change now"
@@ -648,6 +764,14 @@ if [ $DRY = 0 ]; then
     has Kernel.Block || plutil -insert Kernel.Block -array "$C" || fail=1
     plutil -insert Kernel.Block -json '{"Arch":"Any","Comment":"boot framebuffer IONDRVFramebuffer steals index 0 from NVRMFB","Enabled":true,"Identifier":"com.apple.iokit.IONDRVSupport","MaxKernel":"","MinKernel":"","Strategy":"Exclude"}' -append "$C" || fail=1
   fi
+  for k in "${FETCH[@]+"${FETCH[@]}"}"; do ditto "$KT/$k.x/$k" "$KX/$k" || fail=1; done
+  for k in "${ADDK[@]+"${ADDK[@]}"}"; do
+    n=${k%.kext}
+    j="{\"Arch\":\"Any\",\"BundlePath\":\"$k\",\"Comment\":\"$n (NullMoth driver)\",\"Enabled\":true,\"ExecutablePath\":\"Contents/MacOS/$n\",\"MaxKernel\":\"\",\"MinKernel\":\"\",\"PlistPath\":\"Contents/Info.plist\"}"
+    # Lilu loads before every plugin, so it goes first; AMFIPass is a Lilu plugin and goes after it (end of the list)
+    if [ $k = Lilu.kext ]; then plutil -insert Kernel.Add.0 -json "$j" "$C" || fail=1
+    else plutil -insert Kernel.Add -json "$j" -append "$C" || fail=1; fi
+  done
   if [ ${#DELADD[@]} -gt 0 ]; then
     has NVRAM.Delete || plutil -insert NVRAM.Delete -dictionary "$C" || fail=1
     plutil -extract NVRAM.Delete.$B xml1 -o - "$C" >/dev/null 2>&1 || plutil -insert NVRAM.Delete.$B -array "$C" || fail=1
@@ -809,6 +933,15 @@ SINCE=$(date -r "$(sysctl -n kern.boottime | sed -E 's/.*\{ sec = ([0-9]+),.*/\1
 capture "BEFORE restart"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')
 : > "$MARK"   # claim the single shot BEFORE touching WindowServer, so a respawn can never loop
+# Only ever at the login window. 1.9.0 (10-10): with auto-login the session already existed when this fired, so the
+# restart logged the user out to the password screen. A restart under a logged-in user ends their session; never do it.
+CONSOLE=$(stat -f%Su /dev/console 2>/dev/null)
+if [ -n "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)" ]; then
+  echo "$(date) skipped the restart: auto-login is on (a restart would end the automatic session)" >> "$LOG" 2>&1; exit 0
+fi
+if [ -n "$CONSOLE" ] && [ "$CONSOLE" != root ]; then
+  echo "$(date) skipped the restart: $CONSOLE is already logged in" >> "$LOG" 2>&1; exit 0
+fi
 P=$(pgrep -x WindowServer); [ -n "$P" ] && { kill -TERM $P 2>/dev/null; sleep 2; pgrep -x WindowServer >/dev/null 2>&1 && kill -9 $P 2>/dev/null; }
 for i in $(seq 1 30); do pgrep -x WindowServer >/dev/null 2>&1 && break; sleep 1; done
 sleep 8
