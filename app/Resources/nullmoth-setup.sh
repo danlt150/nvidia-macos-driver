@@ -4,6 +4,22 @@ B=7C436110-AB2A-4BBB-A880-FE41995C9F82
 # ipc_control_port_options=0: with AMFI relaxed, Firefox and other hardened apps crash at launch on their task control
 # port (10-10 chat: Firefox "instant crash", fixed by this argument); OpenCore Legacy Patcher sets it for the same reason.
 WANT_ARGS="nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0"
+# The NVIDIA display card's PCI device id (4 hex digits), read from the registry.
+nv_device_id() {
+  ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | LC_ALL=C awk '
+    function emit() { if (v && c && d != "") { print substr(d,3,2) substr(d,1,2); found=1; exit } }
+    /\+-o / { emit(); v=0; c=0; d="" }
+    /"vendor-id" = <de100000>/ { v=1 }
+    /"class-code" = <00000300>/ { c=1 }
+    /"device-id" = </ { if (match($0, /<[0-9a-f]+>/)) d=substr($0, RSTART+1, 4) }
+    END { if (!found) emit() }'
+}
+# Turing (TU102/104/106/117 = 1E00-1FFF, TU116 = 2180-21FF) needs longer for GSP to settle before the display arms:
+# a GTX 1660 SUPER stuck at boot on the 0.5 s default and started with nvrmsettle=10000, as an RTX 2070 SUPER had
+# (Discord 10-11, after 1.12). Only added when the user has not chosen a value.
+NVDEV=$(nv_device_id)
+case "$NVDEV" in 1[eEfF]??|21[89a-fA-F]?) TURING=1;; *) TURING=0;; esac
+[ "$TURING" = 1 ] && WANT_ARGS="$WANT_ARGS nvrmsettle=10000"
 DROP_ARGS="nv_disable=1 -wegnoegpu"          # both hide the NVIDIA card from macOS
 SIP_BITS=$((0x0A43))
 TOOL_NAME="1401: Remove NVIDIA driver"; TOOL_FILE=NullMothSafe.efi
@@ -130,6 +146,8 @@ if [ -n "$COLLECT" ]; then
   # kernel messages, WindowServer's CPU and the refresh rate. Flicker never shows on a 60 Hz single-display test Mac,
   # so the users' own machines are the measurement.
   if [ "${NULLMOTH_SAMPLE:-}" = flicker ]; then
+    # mark the moment in the display tracker, so its timeline shows where the user saw the flicker
+    [ -d /Library/NullMoth/display-trace ] && echo "== USER: flicker seen now $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /Library/NullMoth/display-trace/trace.txt
     { echo "== display timing sample, $(date -u +%Y-%m-%dT%H:%M:%SZ), 20 s at 0.25 s"
       system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Resolution|Refresh|UI Looks|Display Type|Connection Type|Online"
       /usr/bin/log stream --style compact --predicate 'sender == "NVRMFB" OR sender == "NVRM" OR sender == "NVAccel"' > "$COLLECT/.flicker-kmsg" 2>&1 &
@@ -238,6 +256,10 @@ if [ -n "$COLLECT" ]; then
   } > "$COLLECT/driver-crash-window.txt" 2>&1
   n=0; collection_errors=0
   collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/*.panic /Library/Logs/DiagnosticReports/Retired/*.panic
+  # the display tracker (every boot, from the first second): current and previous file, newest 3 MB of each
+  for f in trace.txt trace.txt.1 kernel.txt kernel.txt.1 ws.txt ws.txt.1; do
+    [ -f "/Library/NullMoth/display-trace/$f" ] && tail -c 3145728 "/Library/NullMoth/display-trace/$f" > "$COLLECT/display-$f"
+  done
   # A boot that hung or went black never writes a panic: its kernel messages are only in the log store. Users could not
   # send them (10-10 chat: "the logs from the kernel don't get saved to a file"), so keep the whole kernel log of the boots
   # before this one, up to this boot's start: the tail is how the last failed boot ended.
@@ -308,12 +330,24 @@ if [ $REMOVE = 1 ]; then
   elif [ "$EFI" != auto ]; then
     mount_efi "$EFI" || stop "could not mount the selected OpenCore partition - nothing changed"; MP=$MOUNT_POINT
     C="$MP/${OCREL:-EFI/OC}/config.plist"
-  elif [ -n "${EFI_UUID:-}" ]; then
-    mount_efi "$EFI_UUID" || stop "could not mount the recorded OpenCore partition; attach the original boot disk or select its replacement - nothing changed"; MP=$MOUNT_POINT
-    C="$MP/${OCREL:-EFI/OC}/config.plist"
-  elif [ -n "${CONFIG_PATH:-}" ]; then
-    C=$CONFIG_PATH; [ -f "$C" ] || stop "the recorded config is missing - nothing changed"
+  elif [ -n "${EFI_UUID:-}" ] && mount_efi "$EFI_UUID"; then
+    MP=$MOUNT_POINT; C="$MP/${OCREL:-EFI/OC}/config.plist"
+  elif [ -n "${CONFIG_PATH:-}" ] && [ -f "$CONFIG_PATH" ]; then
+    C=$CONFIG_PATH
     MP=$(cd "$(dirname "$C")/../.." && pwd) || stop "cannot resolve the recorded OpenCore partition"
+  fi
+  # The boot picker's "Remove driver" runs this at the next start, before anything has mounted the EFI partition, so a
+  # record holding only a config path (/Volumes/EFI/...) or a partition that is no longer attached stopped here and the
+  # driver stayed off but installed, start after start (1.6-1.9 recover logs: "the recorded config is missing", "could
+  # not mount the recorded OpenCore partition"; Discord 10-11). The partition OpenCore started this Mac from is the one
+  # whose picker asked for the removal, so it is used instead.
+  if [ -z "$C" ] && [ -z "$CFG" ] && [ "$EFI" = auto ] && { [ -n "${EFI_UUID:-}" ] || [ -n "${CONFIG_PATH:-}" ]; }; then
+    note "the recorded OpenCore config was not found; using the partition this Mac started from"
+    d=$(booted_part) || d=$(boot_esp)
+    [ -n "$d" ] || stop "the recorded OpenCore config is missing and the partition this Mac started from was not found; select its config.plist - nothing changed"
+    mount_efi "$d" || stop "could not mount the OpenCore partition $d - nothing changed"
+    r=$(ocrel_in "$MOUNT_POINT"); [ -n "$r" ] || stop "no OpenCore config on $d; select its config.plist - nothing changed"
+    MP=$MOUNT_POINT; C="$MP/$r/config.plist"; OCREL=$r
   fi
   [ -n "$C" ] || stop "the install record has no OpenCore partition; select the original config - nothing changed"
   if [ -n "$C" ]; then
@@ -652,7 +686,9 @@ step "Checking the OpenCore settings"
 EDITS=(); ADDED=""; REMOVED=""
 args=$(get NVRAM.Add.$B.boot-args); new=""
 for a in $args; do case " $DROP_ARGS " in *" $a "*) echo "CHANGE boot-args: remove $a (it hides the NVIDIA card)"; REMOVED="$REMOVED $a";; *) new="$new $a";; esac; done
-for a in $WANT_ARGS; do case " $new " in *" $a "*) ;; *) new="$new $a"; ADDED="$ADDED $a"; echo "CHANGE boot-args: add $a";; esac; done
+for a in $WANT_ARGS; do
+  case "$a" in nvrmsettle=*) case " $new " in *" nvrmsettle="*) continue;; esac;; esac   # the user's own value wins
+  case " $new " in *" $a "*) ;; *) new="$new $a"; ADDED="$ADDED $a"; echo "CHANGE boot-args: add $a";; esac; done
 new=${new# }
 [ "$new" != "$args" ] && EDITS+=("NVRAM.Add.$B.boot-args|-string|$new")
 cur=$(csr_of); want=$(( cur | SIP_BITS ))
@@ -702,7 +738,18 @@ fi
 # The installer runs on the firmware framebuffer (IONDRVSupport); once the driver is in, that framebuffer would take
 # display index 0 from NVRMFB, so the installed system excludes it (as on the tested RTX 5060 setup).
 NEEDBLOCK=0; bi=$(bidx)
-if [ -z "$bi" ]; then NEEDBLOCK=1; echo "CHANGE Kernel -> Block: exclude IONDRVSupport (the firmware framebuffer would take NVRMFB's display)"
+# Laptops whose built-in panel is wired to an iGPU macOS has no driver for (Intel Tiger Lake and newer): 1401 1.12 keeps
+# that GPU on (no disable-gpu, no framebuffer properties) so the panel shows macOS through the firmware framebuffer.
+# Excluding IONDRVSupport there leaves the built-in screen dark (10-10: 86 of 184 scans had the panel on the Intel GPU).
+IGPU="PciRoot(0x0)/Pci(0x2,0x0)"; INTELPANEL=0
+# LC_ALL=C: ioreg prints raw bytes, and awk in a UTF-8 locale stops on them (measured on studio256)
+if ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | LC_ALL=C awk '/\+-o /{v=0;c=0} /"vendor-id" = <86800000>/{v=1} /"class-code" = <00000300>/{c=1} v&&c{f=1} END{exit !f}' \
+   && ! has "DeviceProperties.Add.$IGPU.disable-gpu" && ! has "DeviceProperties.Add.$IGPU.AAPL,ig-platform-id"; then
+  INTELPANEL=1; note "the built-in screen runs on the Intel GPU through the firmware framebuffer; IONDRVSupport stays on"
+fi
+if [ $INTELPANEL = 1 ]; then
+  [ -n "$bi" ] && [ "$(get Kernel.Block.$bi.Enabled)" = true ] && { EDITS+=("Kernel.Block.$bi.Enabled|-bool|false"); echo "CHANGE Kernel -> Block: turn the IONDRVSupport exclude off (it would leave the built-in screen dark)"; }
+elif [ -z "$bi" ]; then NEEDBLOCK=1; echo "CHANGE Kernel -> Block: exclude IONDRVSupport (the firmware framebuffer would take NVRMFB's display)"
 elif [ "$(get Kernel.Block.$bi.Enabled)" != true ]; then EDITS+=("Kernel.Block.$bi.Enabled|-bool|true"); echo "CHANGE Kernel -> Block: turn the IONDRVSupport exclude on"; fi
 # AMD (AMD Vanilla patches): with Shaneee's "Fix PAT" on, the driver stopped at "RmInitAdapter failed! (0x25:0x40:1310)"
 # right after a valid 8 GB BAR1 (user report 10-10, Ryzen 5 7600 + RTX 4060); switching to Algrey's "Fix PAT" - the one
@@ -738,6 +785,11 @@ if nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 &&
   DELADD+=("nullmoth-remove"); echo "CHANGE NVRAM Delete: add nullmoth-remove (a leftover remove flag this Mac cannot clear from macOS)"
 fi
 NEEDTOOL=0; [ -z "$(tool_index)" ] && { NEEDTOOL=1; echo "CHANGE boot picker: add \"$TOOL_NAME\" (the way back if the driver ever stops macOS starting)"; }
+# The tool asks for Y on screen. Run in graphics mode its text never showed, so it sat waiting for a key nobody could see
+# ("Remove driver hangs", Discord 10-11); text mode shows it. Existing entries are switched too.
+ti=$(tool_index); if [ -n "$ti" ] && [ "$(get Misc.Tools.$ti.TextMode)" != true ]; then
+  echo "CHANGE boot picker: show \"$TOOL_NAME\" in text mode, so its question is visible"; EDITS+=("Misc.Tools.$ti.TextMode|-bool|true"); fi
+REFRESHTOOL=0; [ -n "$ti" ] && [ -f "$TOOL" ] && ! cmp -s "$TOOL" "$(dirname "$C")/Tools/$TOOL_FILE" && REFRESHTOOL=1
 [ ${#EDITS[@]} = 0 ] && [ ${#DELADD[@]} = 0 ] && [ $NEEDTOOL = 0 ] && [ $NEEDBLOCK = 0 ] && [ $NEEDAMFIPASS = 0 ] && ok "OpenCore already has every setting the driver needs"
 
 if [ $SIPON = 1 ]; then
@@ -779,9 +831,10 @@ if [ $DRY = 0 ]; then
   fi
   if [ $NEEDTOOL = 1 ]; then
     plutil -extract Misc.Tools xml1 -o - "$C" >/dev/null 2>&1 || plutil -insert Misc.Tools -array "$C" || fail=1
-    plutil -insert Misc.Tools -json "{\"Arguments\":\"\",\"Auxiliary\":false,\"Comment\":\"NullMoth: remove the NVIDIA driver at the next start\",\"Enabled\":true,\"Flavour\":\"Auto\",\"FullNvramAccess\":true,\"Name\":\"$TOOL_NAME\",\"Path\":\"$TOOL_FILE\",\"RealPath\":false,\"TextMode\":false}" -append "$C" || fail=1
+    plutil -insert Misc.Tools -json "{\"Arguments\":\"\",\"Auxiliary\":false,\"Comment\":\"NullMoth: remove the NVIDIA driver at the next start\",\"Enabled\":true,\"Flavour\":\"Auto\",\"FullNvramAccess\":true,\"Name\":\"$TOOL_NAME\",\"Path\":\"$TOOL_FILE\",\"RealPath\":false,\"TextMode\":true}" -append "$C" || fail=1
     mkdir -p "$MP/$OCREL/Tools" && cp "$TOOL" "$MP/$OCREL/Tools/$TOOL_FILE" || fail=1
   fi
+  [ "${REFRESHTOOL:-0}" = 1 ] && { cp "$TOOL" "$MP/$OCREL/Tools/$TOOL_FILE" || fail=1; }   # the current tool (drains stale keys)
   if [ $fail = 1 ] || ! plutil -lint "$C" >/dev/null; then cp -p "$BKC" "$C"; stop "editing the config failed - the original is restored"; fi
   ok "OpenCore config updated"
   mkdir -p "$ST"
@@ -961,5 +1014,78 @@ cat > /Library/LaunchDaemons/com.nullmoth.wsreset.plist <<'PL'
 PL
 chmod 644 /Library/LaunchDaemons/com.nullmoth.wsreset.plist; chown root:wheel /Library/LaunchDaemons/com.nullmoth.wsreset.plist
 ok "flicker stopgap armed (restarts WindowServer once per boot; opt out with /Library/NullMoth/no-wsreset)"
+# Display tracker: flicker and black screens only happen on monitors we do not have (>60 Hz DisplayPort, two displays),
+# and a "Send logs" afterwards only photographs the end state. This records from boot: the driver's flip/scan-out/AGDC
+# counters every second (only lines that changed, plus a heartbeat), the refresh rate of each framebuffer, every
+# WindowServer start or restart with a full snapshot, and the driver's kernel messages (repeated flip lines counted per
+# second instead of dropped). Bounded: each file rotates at 8 MB, one old copy kept. "Send logs" uploads both.
+cat > /Library/NullMoth/nullmoth-displaytrace.sh <<'DT'
+#!/bin/bash
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+kextstat 2>/dev/null | grep -q com.nullmoth.NVAccel || exit 0
+D=/Library/NullMoth/display-trace; mkdir -p "$D"; chmod 755 "$D"
+T=$D/trace.txt; K=$D/kernel.txt; W=$D/ws.txt; CAP=8388608
+rot() { local s; s=$(stat -f%z "$1" 2>/dev/null || echo 0); [ "$s" -gt $CAP ] && mv -f "$1" "$1.1"; }
+rot "$T"; rot "$K"; rot "$W"
+CTRS="debug.nvaccel_iop_ok debug.nvaccel_iop_fail debug.nvaccel_iop_empty debug.nvaccel_iop_blank debug.nvaccel_iop_flips debug.nvaccel_iop_flip_hit debug.nvaccel_iop_flip_miss debug.nvaccel_iop_flip_stale debug.nvaccel_iop_flip_refused debug.nvaccel_iop_flip_novram debug.nvaccel_iop_flip_lock debug.nvaccel_iop_flip_home debug.nvaccel_iop_async_flips debug.nvaccel_iop_async_refused debug.nvaccel_iop_async_drop debug.nvaccel_iop_ok_h0 debug.nvaccel_iop_ok_h1 debug.nvaccel_iop_ok_h2 debug.nvaccel_iop_ok_h3 debug.nvaccel_heads_published debug.nvaccel_heads_piped debug.nvrmfb_agdc_cmds debug.nvrmfb_agdc_refused debug.nvrmfb_agdc_last_refused debug.nvrmfb_agdc_k5_link debug.nvrmfb_agdc_k5_caps debug.nvrmfb_agdc_fbmap"
+hz() { ioreg -r -c NVRMNVDAFramebuffer -w0 2>/dev/null | LC_ALL=C awk '
+  /"IOFBDependentIndex" =/    { if (match($0, /= [0-9]+/)) idx = substr($0, RSTART+2, RLENGTH-2) }
+  /"IOFBCurrentPixelCount" =/ { if (match($0, /= [0-9]+/)) cnt = substr($0, RSTART+2, RLENGTH-2) }
+  /"IOFBCurrentPixelClock" =/ { if (match($0, /= [0-9]+/)) { clk = substr($0, RSTART+2, RLENGTH-2);
+    if (cnt+0 > 0) printf "fb%s=%.2fHz ", idx, clk/cnt; cnt="" } }'; }
+snapshot() {
+  { echo "== $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) up=$(($(date +%s) - BOOT))s"
+    echo "boot-args: $(nvram boot-args 2>/dev/null | cut -f2-)"
+    sysctl debug 2>/dev/null | grep -E '^debug\.(nvaccel|nvrmfb)' | grep -v -E 'nvaccel_vm_|nvaccel_res_|nvaccel_map_'
+    ioreg -r -c NVRMNVDAFramebuffer -w0 2>/dev/null | grep -oaE '"(IOFB[A-Za-z]*(Mode|Timing|Pixel)[A-Za-z]*|IOFBDependentIndex|NVRMTrace|NVRMTraceCount|reflips|fVblCalls|fBarPaints)" = [^,}]{0,240}'
+    echo "displays: $(hz)"
+    # The monitor's own list of timings: a rate that goes black is checked against what the panel says it accepts
+    ioreg -l -r -c AppleDisplay -w0 2>/dev/null | grep -oaE '"IODisplayEDID" = <[0-9a-f]+>' | sort -u
+    echo
+  } >> "$T" 2>&1; }
+BOOT=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
+echo "#### boot $(date -r "$BOOT" -u +%Y-%m-%dT%H:%M:%SZ), tracker start $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$T"
+# kernel messages: the flip/vblank lines repeat many times a second, so identical lines become "Nx <line>" per second
+/usr/bin/log stream --style compact --predicate 'sender == "NVRMFB" OR sender == "NVRM" OR sender == "NVAccel"' 2>/dev/null \
+  | awk '{ s = substr($0, 1, 19); m = $0; sub(/^[^ ]+ [^ ]+ +[^ ]+ +[^ ]+ +/, "", m); gsub(/[0-9]+/, "#", m)
+           if (s != ls || m != lm) { if (n) print (n > 1 ? n "x " : "") last; n = 0 }
+           ls = s; lm = m; last = $0; n++; fflush() }' >> "$K" &
+LS=$!
+# WindowServer's side of a mode change (the ">60 Hz goes black" reports): our kexts log a successful commit at every
+# rate, so the black is after the modeset and only WindowServer/CoreDisplay say what happened next. Same per-second
+# folding, own file so it cannot crowd out the kernel lines.
+/usr/bin/log stream --style compact --predicate 'process == "WindowServer" AND (eventMessage CONTAINS[c] "mode" OR eventMessage CONTAINS[c] "refresh" OR eventMessage CONTAINS[c] "reconfig" OR eventMessage CONTAINS[c] "blank" OR eventMessage CONTAINS[c] "online" OR eventMessage CONTAINS[c] "timing" OR eventMessage CONTAINS[c] "revert" OR eventMessage CONTAINS[c] "edid") AND NOT eventMessage CONTAINS "RunLoopMode"' 2>/dev/null \
+  | awk '{ s = substr($0, 1, 19); m = $0; sub(/^[^ ]+ [^ ]+ +[^ ]+ +[^ ]+ +/, "", m); gsub(/[0-9]+/, "#", m)
+           if (s != ls || m != lm) { if (n) print (n > 1 ? n "x " : "") last; n = 0 }
+           ls = s; lm = m; last = $0; n++; fflush() }' >> "$W" &
+LW=$!
+trap 'kill $LS $LW 2>/dev/null' EXIT
+WS=""; PREV=""; i=0
+while :; do
+  w=$(pgrep -x WindowServer | head -1)
+  if [ "$w" != "$WS" ]; then snapshot "WindowServer ${WS:+restarted ($WS -> )}${w:-gone}"; WS=$w; fi
+  cur="$(sysctl $CTRS 2>/dev/null | sed -E 's/^debug\.(nvaccel_|nvrmfb_)?//; s/: /=/' | tr '\n' ' ')$(hz)"
+  if [ "$cur" != "$PREV" ] || [ $((i % 30)) = 0 ]; then echo "$(date -u +%H:%M:%S) ws=$w $cur" >> "$T"; PREV=$cur; fi
+  i=$((i + 1))
+  # every second for the first 15 minutes after boot (the handoff and login), then every 5 s
+  if [ $(( $(date +%s) - BOOT )) -lt 900 ]; then sleep 1; else sleep 5; fi
+  [ $((i % 300)) = 0 ] && { rot "$T"; for f in "$K" "$W"; do s=$(stat -f%z "$f" 2>/dev/null || echo 0); [ "$s" -gt $CAP ] && { cp "$f" "$f.1"; : > "$f"; }; done; }
+done
+DT
+chmod 755 /Library/NullMoth/nullmoth-displaytrace.sh; chown root:wheel /Library/NullMoth/nullmoth-displaytrace.sh
+cat > /Library/LaunchDaemons/com.nullmoth.displaytrace.plist <<'PL'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.nullmoth.displaytrace</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/Library/NullMoth/nullmoth-displaytrace.sh</string></array>
+<key>RunAtLoad</key><true/>
+<key>ProcessType</key><string>Background</string>
+<key>LowPriorityIO</key><true/>
+<key>Nice</key><integer>10</integer>
+</dict></plist>
+PL
+chmod 644 /Library/LaunchDaemons/com.nullmoth.displaytrace.plist; chown root:wheel /Library/LaunchDaemons/com.nullmoth.displaytrace.plist
+ok "display tracker armed (records the driver's display state from every boot; Send logs uploads it)"
 if [ $INSTALL_THEN_PREPARE = 1 ]; then do_prepare; else ok "driver installed - restart to load it"; fi
 cleanup; echo "RESULT ok"
