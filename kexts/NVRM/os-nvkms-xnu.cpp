@@ -36,7 +36,7 @@ static void kms_timer_drain(thread_call_param_t, thread_call_param_t);
 // System sleep, the part nvkms_pm_lock does in nvidia-modeset-linux.c. nvkms_xnu_suspend() moves NVKMS to SUSPENDED
 // under gKmsLock before RM puts the GPU in standby, and nvkms_xnu_resume() moves it back once RM has resumed it (LOST
 // when the resume failed). While NVKMS is not RUNNING nothing may reach the display engine: a push to the core channel
-// of a GPU that lost power spins in nvEvoMakeRoom forever (the 10-12 wake hang, "Darkwake Exit Failure").
+// of a GPU that lost power spins in nvEvoMakeRoom forever.
 enum { kKmsPmRunning = 0, kKmsPmSuspended = 1, kKmsPmLost = 2 };
 static int gKmsPmState = kKmsPmRunning;
 static const uint32_t kKmsPmWaitMs = 30000;

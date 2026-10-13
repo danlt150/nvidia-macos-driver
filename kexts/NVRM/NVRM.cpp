@@ -154,8 +154,8 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrm_evt_waits, CTLFLAG_RD, (int64_t *)&gNvEvtWait
 
 // System sleep gate, the nv_system_pm_lock of kernel-open/nvidia/nv.c. Linux freezes user space before suspend and
 // still takes that lock in every ioctl; macOS freezes nothing, so on wake WindowServer and Metal apps called into RM
-// while the GPU was still in standby (10-12 22:49: an auto-unmap mid-standby broke the GMMU walk, TLB invalidates
-// failed and RESUME took 31 s; 22:55: NVK got errors and WindowServer froze on the restored frame). The PM thread
+// while the GPU was still in standby (an auto-unmap mid-standby broke the GMMU walk, TLB invalidates
+// failed and RESUME took 31 s; NVK got errors and WindowServer froze on the restored frame). The PM thread
 // closes the gate before NVKMS suspend and opens it after RM and NVKMS resume; calls arriving meanwhile wait.
 static IOLock  *gNvPmGate;
 static int      gNvPmUsers;
@@ -197,7 +197,7 @@ static int nv_xnu_pm_close(uint32_t waitMs)
     return left;
 }
 // System wake runs on another PM thread than the sleep that closed the gate: hand it the gate before RM and NVKMS
-// resume (10-12 23:31: nvKmsResume's RM calls waited at the gate on the wake thread until the 180 s wake watchdog panicked).
+// resume (nvKmsResume's RM calls waited at the gate on the wake thread until the 180 s wake watchdog panicked).
 static void nv_xnu_pm_take(void)
 {
     if (!gNvPmGate) return;
@@ -1134,7 +1134,7 @@ IOReturn NVRM::go(uint32_t pass)
             if (!PE_parse_boot_argn("-nvrmnopm", nopmArg, sizeof nopmArg)) {
                 // Keep every video memory allocation over system sleep, not only RM's own: WindowServer's GPU
                 // channels (NVK through NVAccel) keep push buffers and semaphores in VRAM, and without them the
-                // compositor waited on fences forever after the first wake (10-12: black screen, no cursor).
+                // compositor waited on fences forever after the first wake.
                 // RM saves them through its temporary-file interface, which os-xnu2.cpp backs with pageable kernel memory.
                 rm_write_registry_dword(NULL, NULL, "PreserveVideoMemoryAllocations", 1);
                 LOG("registry: PreserveVideoMemoryAllocations=1 (all VRAM survives system sleep)");
@@ -1545,7 +1545,7 @@ IOReturn NVRMUserClient::clientClose(void)
         fCleaned = true;
         if (gNvClientsLock && fFd >= 0) { IOLockLock(gNvClientsLock); gNvClients[fFd] = NULL; nv_pm_close(fPm); IOLockUnlock(gNvClientsLock); }
         if (fKms) { nvkms_xnu_close(fKms); fKms = nullptr; }
-        if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }   // mid-standby frees broke the GMMU walk (10-12 22:49)
+        if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }
         if (fMmap.memArea.pRanges) { kern_os_free(fMmap.memArea.pRanges); fMmap.memArea.pRanges = NULL; }
         if (nv_xnu_chat()) kprintf("NVRM-xnu: client fd %d closed\n", fFd);
     }
